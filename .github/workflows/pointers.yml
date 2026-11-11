@@ -1,0 +1,464 @@
+name: pointers
+
+# Every 10 minutes, reads /v1/attestation for prod and dev and appends each new pointer to a door boot
+# record in Sigstore's Rekor v2 to <environment>.jsonl, one JSON object a line, and archives the entry's
+# leaf under leaves/<log>/<index>.json. It signs nothing and reads no repository variable or secret. A
+# pointer is a hint: the watcher verifies the entry it names, so a wrong pointer costs only a failed
+# verification, and anyone can check an archived leaf with the log's key and the witnesses' keys.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: pointers
+  cancel-in-progress: false
+
+jobs:
+  pointers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      PROD_ATTESTATION: https://api.trymorse.ai/v1/attestation
+      DEV_ATTESTATION: https://vault.watermark.ac/v1/attestation
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Writes each attestation answer to a file and reads it only with jq. An environment that does not
+      # answer with its attestation is skipped with a warning, so the other environment's pointers still
+      # land: the vault's dev endpoint sits behind Cloudflare Access, which answers a runner with a
+      # redirect to its login page. A candidate is a receipt from an instance's door object whose log is
+      # a Rekor v2 shard and whose index is an integer. Nothing read here reaches a command line.
+      - id: read
+        run: |
+          set -euo pipefail
+          dir=$RUNNER_TEMP/attestation
+          mkdir -p "$dir"
+          for environment in prod dev; do
+            case $environment in
+              prod) url=$PROD_ATTESTATION ;;
+              dev) url=$DEV_ATTESTATION ;;
+            esac
+            answer=$dir/$environment.json
+            if ! curl -sS --fail --max-time 30 --output "$answer" "$url"; then
+              echo "::warning::$url did not answer, so this run adds no $environment pointers"
+              continue
+            fi
+            if ! jq -e --arg environment "$environment" \
+              '.object == "proxy_attestation" and .environment == $environment and (.instances | type == "array")' \
+              "$answer" >/dev/null 2>&1; then
+              echo "::warning::$url did not answer with a $environment attestation, so this run adds no $environment pointers"
+              continue
+            fi
+            if ! jq -c '
+              [.instances[] | objects | .door | objects
+                | select(.spki_sha256 | type == "string" and test("\\A[0-9a-f]{64}\\z"))
+                | .spki_sha256 as $spki
+                | .records | arrays | .[] | objects
+                | select(.log | type == "string" and test("\\Alog[0-9]{4}-[0-9]+\\.rekor\\.sigstore\\.dev\\z"))
+                | select(.index | type == "number" and . >= 0 and . == floor and . < 9007199254740992)
+                | {log, index: (.index | floor), spki_sha256: $spki}]
+              | unique_by([.log, .index]) | .[]' "$answer" >"$dir/$environment.candidates"; then
+              echo "::warning::$url answered an attestation jq could not read, so this run adds no $environment pointers"
+              rm -f "$dir/$environment.candidates"
+              continue
+            fi
+            echo "$environment: $(wc -l <"$dir/$environment.candidates") receipts on $url"
+          done
+
+      # For each candidate not yet in <environment>.jsonl, reads the entry from the shard's tiles. The
+      # entry must carry a morse-door-boot-v1 record of that environment for the door's SPKI, and its
+      # Nitro document names the boot. It then appends the pointer and archives the leaf: the canonical
+      # body, its inclusion proof, and the cosigned checkpoint the proof is against, in the shape of the
+      # TransparencyLogEntry a Rekor v2 write returns. A pointer whose leaf is not archived yet, one added
+      # by hand among them, is archived on a later run. A candidate that fails is skipped with a warning
+      # and tried again on the next run.
+      - id: archive
+        shell: python3 -I {0}
+        run: |
+          import base64
+          import hashlib
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          ENVIRONMENTS = ("prod", "dev")
+          RECORD_TYPE = "morse-door-boot-v1"
+          RECORD_OID = "1.3.6.1.4.1.67561.1"
+          SHARD = re.compile(r"log[0-9]{4}-[0-9]+\.rekor\.sigstore\.dev", re.ASCII)
+          HEX64 = re.compile(r"[0-9a-f]{64}", re.ASCII)
+          TUF = "https://tuf-repo-cdn.sigstore.dev"
+          # The cosignatures the door's enclave and the watcher require on a checkpoint.
+          COSIGNERS = 3
+          TILE_WIDTH = 256
+          # Bounds one run's reads, so a long custody chain lands over several runs instead of none.
+          MAX_LEAVES = 200
+          work = Path(os.environ["RUNNER_TEMP"]) / "attestation"
+          cache = {}
+
+
+          class Skip(Exception):
+              pass
+
+
+          def clean(text):
+              return re.sub(r"[^ -~]", "?", str(text))[:300]
+
+
+          def get(url):
+              request = urllib.request.Request(url, headers={"User-Agent": "morse-records-pointers"})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return response.read()
+
+
+          def log_id(log):
+              """The shard's log id from Sigstore's trusted root, read through the TUF CDN's version chain.
+              Nothing here is verified: a wrong id makes an archived leaf fail verification, nothing more."""
+              if "ids" not in cache:
+                  timestamp = json.loads(get(f"{TUF}/timestamp.json"))
+                  snapshot = json.loads(get(f"{TUF}/{int(timestamp['signed']['meta']['snapshot.json']['version'])}.snapshot.json"))
+                  targets = json.loads(get(f"{TUF}/{int(snapshot['signed']['meta']['targets.json']['version'])}.targets.json"))
+                  digest = targets["signed"]["targets"]["trusted_root.json"]["hashes"]["sha256"]
+                  if not isinstance(digest, str) or not HEX64.fullmatch(digest):
+                      raise ValueError("targets.json names trusted_root.json by no SHA-256")
+                  root = get(f"{TUF}/targets/{digest}.trusted_root.json")
+                  if hashlib.sha256(root).hexdigest() != digest:
+                      raise ValueError("trusted_root.json does not match its SHA-256 in targets.json")
+                  cache["ids"] = {urllib.parse.urlsplit(t["baseUrl"]).netloc: t["logId"]["keyId"]
+                                  for t in json.loads(root)["tlogs"] if t["publicKey"]["keyDetails"] == "PKIX_ED25519"}
+              if log not in cache["ids"]:
+                  raise Skip(f"Sigstore's trusted root lists no Ed25519 log {log}")
+              return cache["ids"][log]
+
+
+          def tile_index(n):
+              digits = f"{n:03d}"
+              digits = "0" * (-len(digits) % 3) + digits
+              groups = [digits[i:i + 3] for i in range(0, len(digits), 3)]
+              return "/".join([f"x{g}" for g in groups[:-1]] + groups[-1:])
+
+
+          def node(left, right):
+              return hashlib.sha256(b"\x01" + left + right).digest()
+
+
+          class Tiles:
+              """The shard's C2SP tlog-tiles for a tree of size, read over https."""
+
+              def __init__(self, log, size):
+                  self.base, self.size, self.read = f"https://{log}/api/v2/tile/", size, {}
+
+              def fetch(self, path, width):
+                  if path not in self.read:
+                      try:
+                          self.read[path] = get(self.base + path + (f".p/{width}" if width < TILE_WIDTH else ""))
+                      except urllib.error.HTTPError:
+                          if width == TILE_WIDTH:
+                              raise
+                          self.read[path] = get(self.base + path)
+                  return self.read[path]
+
+              def hash(self, level, index):
+                  tile_level, rise = divmod(level, 8)
+                  n, at = divmod(index << rise, TILE_WIDTH)
+                  width = min(TILE_WIDTH, (self.size >> (8 * tile_level)) - n * TILE_WIDTH)
+                  data = self.fetch(f"{tile_level}/{tile_index(n)}", width)
+                  hashes = [data[(at + i) * 32:(at + i + 1) * 32] for i in range(1 << rise)]
+                  if len(hashes[-1]) != 32:
+                      raise ValueError(f"tile {tile_level}/{n} holds no hash at {at + len(hashes) - 1}")
+                  while len(hashes) > 1:
+                      hashes = [node(hashes[i], hashes[i + 1]) for i in range(0, len(hashes), 2)]
+                  return hashes[0]
+
+              def subtree(self, start, size):
+                  if size & (size - 1) == 0 and start % size == 0:
+                      return self.hash(size.bit_length() - 1, start // size)
+                  k = 1 << ((size - 1).bit_length() - 1)
+                  return node(self.subtree(start, k), self.subtree(start + k, size - k))
+
+              def inclusion(self, index):
+                  def path(m, start, n):
+                      if n == 1:
+                          return []
+                      k = 1 << ((n - 1).bit_length() - 1)
+                      if m < k:
+                          return path(m, start, k) + [self.subtree(start + k, n - k)]
+                      return path(m - k, start + k, n - k) + [self.subtree(start, k)]
+                  return path(index, 0, self.size)
+
+              def entry(self, index):
+                  n, at = divmod(index, TILE_WIDTH)
+                  data, entries = self.fetch(f"entries/{tile_index(n)}", min(TILE_WIDTH, self.size - n * TILE_WIDTH)), []
+                  while data:
+                      length = int.from_bytes(data[:2], "big")
+                      if len(data) < 2 + length:
+                          raise ValueError(f"entry bundle {n} is truncated")
+                      entries.append(data[2:2 + length])
+                      data = data[2 + length:]
+                  if at >= len(entries):
+                      raise ValueError(f"entry bundle {n} holds no entry {at}")
+                  return entries[at]
+
+
+          def root_from_inclusion(index, size, leaf, proof):
+              """RFC 9162 Section 2.1.3.2, folded from the leaf at index to the root of a tree of size."""
+              inner = (index ^ (size - 1)).bit_length()
+              if len(proof) != inner + bin(index >> inner).count("1"):
+                  raise ValueError("the inclusion proof has the wrong length")
+              h = leaf
+              for i, p in enumerate(proof[:inner]):
+                  h = node(h, p) if (index >> i) & 1 == 0 else node(p, h)
+              for p in proof[inner:]:
+                  h = node(p, h)
+              return h
+
+
+          def checkpoint(log):
+              """The shard's newest checkpoint, read once a run, with at least COSIGNERS cosignature lines."""
+              if log not in cache:
+                  try:
+                      note = get(f"https://{log}/api/v2/checkpoint").decode()
+                      split = note.rfind("\n\n")
+                      lines = note[:split].split("\n")
+                      if split < 0 or len(lines) < 3 or lines[0] != log or not lines[1].isascii() or not lines[1].isdigit():
+                          raise ValueError(f"{log}'s checkpoint is not a checkpoint of {log}")
+                      size, root = int(lines[1]), base64.b64decode(lines[2], validate=True)
+                      if len(root) != 32:
+                          raise ValueError(f"{log}'s checkpoint has no 32-byte root hash")
+                      signers = {line.split(" ")[1] for line in note[split + 2:].splitlines() if line.startswith("— ") and " " in line[2:]}
+                      if len(signers - {log}) < COSIGNERS:
+                          raise Skip(f"{log}'s checkpoint carries {len(signers - {log})} cosignatures, fewer than {COSIGNERS}")
+                      cache[log] = (note, size, root, Tiles(log, size))
+                  except Exception as e:
+                      cache[log] = e
+              if isinstance(cache[log], Exception):
+                  raise cache[log]
+              return cache[log]
+
+
+          def read_leaf(log, index):
+              """The entry's canonical body and its archive, a TransparencyLogEntry whose proof reaches the checkpoint."""
+              note, size, root, tiles = checkpoint(log)
+              if index >= size:
+                  raise Skip(f"{log}'s checkpoint holds {size} entries, not yet index {index}")
+              body, proof = tiles.entry(index), tiles.inclusion(index)
+              if root_from_inclusion(index, size, hashlib.sha256(b"\x00" + body).digest(), proof) != root:
+                  raise ValueError(f"the proof from {log}'s tiles does not reach its checkpoint's root hash")
+              b64 = lambda raw: base64.b64encode(raw).decode()
+              archived = json.dumps({
+                  "logIndex": str(index), "logId": {"keyId": log_id(log)}, "kindVersion": {"kind": "hashedrekord", "version": "0.0.2"},
+                  "inclusionProof": {"logIndex": str(index), "rootHash": b64(root), "treeSize": str(size),
+                                     "hashes": [b64(h) for h in proof], "checkpoint": {"envelope": note}},
+                  "canonicalizedBody": b64(body),
+              }) + "\n"
+              return body, archived
+
+
+          def der(data, at=0):
+              """One DER element at at: its tag, its contents, and where it ends."""
+              tag, length, at = data[at], data[at + 1], at + 2
+              if length & 0x80:
+                  width = length & 0x7F
+                  if not 1 <= width <= 4:
+                      raise ValueError("a DER length is not definite")
+                  length, at = int.from_bytes(data[at:at + width], "big"), at + width
+              if at + length > len(data):
+                  raise ValueError("a DER element is truncated")
+              return tag, data[at:at + length], at + length
+
+
+          def children(data):
+              at, found = 0, []
+              while at < len(data):
+                  tag, contents, at = der(data, at)
+                  found.append((tag, contents))
+              return found
+
+
+          def oid(contents):
+              arcs, value = [], 0
+              for byte in contents:
+                  value = value << 7 | byte & 0x7F
+                  if not byte & 0x80:
+                      arcs.append(value)
+                      value = 0
+              return ".".join(map(str, [min(arcs[0] // 40, 2), arcs[0] - 40 * min(arcs[0] // 40, 2), *arcs[1:]]))
+
+
+          def record_of(certificate):
+              """The record the record certificate's extension carries. Its signature and dates prove nothing."""
+              tbs = children(der(certificate)[1])[0][1]
+              for tag, contents in children(tbs):
+                  if tag != 0xA3:
+                      continue
+                  for _, extension in children(children(contents)[0][1]):
+                      parts = children(extension)
+                      if parts[0][0] == 0x06 and oid(parts[0][1]) == RECORD_OID and parts[-1][0] == 0x04:
+                          tag, value, end = der(parts[-1][1])
+                          if tag != 0x04 or end != len(parts[-1][1]):
+                              raise ValueError("the record extension is not one OCTET STRING")
+                          return json.loads(value)
+              raise ValueError("the certificate carries no record extension")
+
+
+          def cbor(data, at=0):
+              """One CBOR item at at, and where it ends: enough of RFC 8949 for a Nitro document."""
+              major, info, at = data[at] >> 5, data[at] & 31, at + 1
+              if info == 31 and major in (2, 3, 4, 5):
+                  # An indefinite length, which the Nitro document's payload map uses: items up to a break.
+                  items = []
+                  while data[at] != 0xFF:
+                      item, at = cbor(data, at)
+                      items.append(item)
+                  if major in (2, 3):
+                      return (b"" if major == 2 else "").join(items), at + 1
+                  return (items if major == 4 else dict(zip(items[::2], items[1::2]))), at + 1
+              if info < 24:
+                  n = info
+              elif info < 28:
+                  width = 1 << (info - 24)
+                  n, at = int.from_bytes(data[at:at + width], "big"), at + width
+              else:
+                  raise ValueError("a reserved CBOR length")
+              if major == 0:
+                  return n, at
+              if major == 1:
+                  return -1 - n, at
+              if major in (2, 3):
+                  if at + n > len(data):
+                      raise ValueError("a CBOR string is truncated")
+                  return (data[at:at + n] if major == 2 else data[at:at + n].decode()), at + n
+              if major == 4:
+                  items = []
+                  for _ in range(n):
+                      item, at = cbor(data, at)
+                      items.append(item)
+                  return items, at
+              if major == 5:
+                  items = {}
+                  for _ in range(n):
+                      key, at = cbor(data, at)
+                      items[key], at = cbor(data, at)
+                  return items, at
+              if major == 6:
+                  return cbor(data, at)
+              return {20: False, 21: True, 22: None}.get(n), at
+
+
+          def pointer_of(environment, log, index, spki, body):
+              """The pointer to an entry that carries a morse-door-boot-v1 record of environment for spki. The
+              boot is the HPKE key id that the record's Nitro document names, as the watcher derives it."""
+              spec = json.loads(body)["spec"]["hashedRekordV002"]
+              digest = base64.b64decode(spec["data"]["digest"], validate=True)
+              if digest != hashlib.sha256(f"{RECORD_TYPE}\n{spki}\n".encode()).digest():
+                  raise Skip(f"the entry's digest is not the record digest of the door's SPKI {spki}")
+              record = record_of(base64.b64decode(spec["signature"]["verifier"]["x509Certificate"]["rawBytes"], validate=True))
+              if record["type"] != RECORD_TYPE or record["environment"] != environment or record["spki_sha256"] != spki:
+                  raise Skip(f"the entry carries no {environment} {RECORD_TYPE} record for SPKI {spki}")
+              document = cbor(base64.b64decode(record["document"], validate=True))[0]
+              user_data = cbor(document[2])[0]["user_data"]
+              prefix = f"morse-proxy-hpke-v1|{environment}|".encode()
+              if not isinstance(user_data, bytes) or not user_data.startswith(prefix) or len(user_data) != len(prefix) + 32:
+                  raise Skip(f"the record's document names no {environment} HPKE key")
+              boot = hashlib.sha256(user_data[len(prefix):]).hexdigest()[:16]
+              return {"log": log, "index": index, "spki_sha256": spki, "boot": boot}
+
+
+          def lines_of(path):
+              found = []
+              for line in path.read_text().splitlines() if path.exists() else []:
+                  try:
+                      p = json.loads(line)
+                      if isinstance(p["log"], str) and SHARD.fullmatch(p["log"]) and type(p["index"]) is int and p["index"] >= 0:
+                          found.append(p)
+                  except (ValueError, TypeError, KeyError):
+                      pass
+              return found
+
+
+          def archive(log, index, archived):
+              leaf = Path("leaves") / log / f"{index}.json"
+              if leaf.exists():
+                  return 0
+              leaf.parent.mkdir(parents=True, exist_ok=True)
+              leaf.write_text(archived)
+              return 1
+
+
+          added, leaves, budget = {}, 0, MAX_LEAVES
+          for environment in ENVIRONMENTS:
+              path, candidates = Path(f"{environment}.jsonl"), work / f"{environment}.candidates"
+              known = {(p["log"], p["index"]) for p in lines_of(path)}
+              new = []
+              for line in candidates.read_text().splitlines() if candidates.exists() else []:
+                  c = json.loads(line)
+                  log, index, spki = c["log"], c["index"], c["spki_sha256"]
+                  if not (isinstance(log, str) and SHARD.fullmatch(log) and type(index) is int and index >= 0 and isinstance(spki, str) and HEX64.fullmatch(spki)):
+                      print(f"::warning::the read step wrote a {environment} candidate outside the pointer format, so this run skips it")
+                      continue
+                  if (log, index) in known:
+                      continue
+                  if budget == 0:
+                      print(f"::warning::this run read {MAX_LEAVES} leaves, so the rest wait for the next run")
+                      break
+                  budget -= 1
+                  try:
+                      body, archived = read_leaf(log, index)
+                      new.append(pointer_of(environment, log, index, spki, body))
+                  except Exception as e:
+                      print(f"::warning::{environment} pointer {log}/{index} is not added this run: {clean(e)}")
+                      continue
+                  known.add((log, index))
+                  leaves += archive(log, index, archived)
+              if new:
+                  text = path.read_text() if path.exists() else ""
+                  with path.open("a") as f:
+                      f.write("" if text == "" or text.endswith("\n") else "\n")
+                      f.writelines(json.dumps(p) + "\n" for p in new)
+                  added[environment] = len(new)
+
+          for environment in ENVIRONMENTS:
+              for p in lines_of(Path(f"{environment}.jsonl")):
+                  if (Path("leaves") / p["log"] / f"{p['index']}.json").exists() or budget == 0:
+                      continue
+                  budget -= 1
+                  try:
+                      leaves += archive(p["log"], p["index"], read_leaf(p["log"], p["index"])[1])
+                  except Exception as e:
+                      print(f"::warning::the leaf of {p['log']}/{p['index']} is not archived this run: {clean(e)}")
+
+          summary = ", ".join(f"{n} {environment}" for environment, n in added.items()) or "no"
+          (work / "message").write_text(f"Add {summary} pointers and archive {leaves} leaves\n")
+          print(f"added {summary} pointers and archived {leaves} leaves")
+
+      # Commits what the archive step wrote and pushes it to main as a fast-forward. Ruleset 26575146
+      # refuses only force-pushes and deletions, so this push needs no bypass. The token is in this
+      # step's environment alone, and the checkout kept no credentials.
+      - id: push
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git add --all
+          if git diff --cached --quiet; then
+            echo "no new pointers or leaves"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet --file "$RUNNER_TEMP/attestation/message"
+          auth="http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          if ! git -c "$auth" push origin HEAD:main; then
+            git -c "$auth" fetch origin main
+            git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" rebase origin/main
+            git -c "$auth" push origin HEAD:main
+          fi

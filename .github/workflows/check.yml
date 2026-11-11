@@ -1,0 +1,202 @@
+name: check
+
+# Tests pointers.yml before a change to it reaches main. The pointers job takes the steps it tests from
+# pointers.yml, so the tests run the code that writes main.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # The lint of trymorse/morse-pins's check.yml, copied. Fails on a repository variable or secret in any
+  # workflow, since a watcher cannot read either and the pointers would then depend on it, and on a uses:
+  # that is not pinned to a 40-hex commit SHA, since a moved tag would change what writes main with no
+  # commit here to show it.
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: lint
+        run: |
+          set -euo pipefail
+          failed=0
+          for workflow in .github/workflows/*.yml .github/workflows/*.yaml; do
+            [ -e "$workflow" ] || continue
+            if grep -nE '(vars|secrets)\.' "$workflow"; then
+              echo "::error file=$workflow::$workflow reads a repository variable or secret, which a watcher cannot read"
+              failed=1
+            fi
+            uses=$(yq '.. | select(tag == "!!map" and has("uses")) | .uses' "$workflow")
+            unpinned=$(grep -vxE '[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}' <<<"$uses" || true)
+            if [ -n "$uses" ] && [ -n "$unpinned" ]; then
+              echo "::error file=$workflow::$workflow uses $unpinned, which is not pinned to a 40-hex commit SHA"
+              failed=1
+            fi
+          done
+          exit $failed
+      - run: |
+          set -euo pipefail
+          lint=$RUNNER_TEMP/lint.sh
+          yq -e '.jobs.lint.steps[] | select(.id == "lint") | .run' .github/workflows/check.yml >"$lint"
+          failed=0
+          # Assembled, so that this file neither reads a variable or secret nor holds an expression.
+          var=$(printf '%s' va rs.)
+          secret=$(printf '%s' secr ets.)
+          expression() { printf '%s{{ %s }}' '$' "$1"; }
+
+          lints() { (cd "$1" && bash --noprofile --norc -eo pipefail "$lint" >/dev/null 2>&1); }
+          # Copies .github, runs the command in the copy, and prints the copy's directory.
+          mutated() {
+            local dir
+            dir=$(mktemp -d)
+            cp -R .github "$dir/"
+            (cd "$dir" && "$@") >/dev/null
+            echo "$dir"
+          }
+          refuses() {
+            local why=$1 dir
+            shift
+            dir=$(mutated "$@")
+            if lints "$dir"; then
+              echo "FAIL: the lint passed $why"; failed=1
+            fi
+          }
+          # shellcheck disable=SC2329 # mutated runs these
+          edit() { VALUE=$3 yq -i "$2 = strenv(VALUE)" "$1"; }
+          # shellcheck disable=SC2329
+          append() { printf '%s\n' "$2" >>"$1"; }
+
+          if ! lints "$(mutated true)"; then
+            echo "FAIL: the lint refused the workflows as they are"; failed=1
+          fi
+          refuses "a repository variable in pointers.yml" edit .github/workflows/pointers.yml .jobs.pointers.env.X "$(expression "${var}X")"
+          refuses "a secret in pointers.yml" edit .github/workflows/pointers.yml .jobs.pointers.env.X "$(expression "${secret}X")"
+          refuses "a repository variable in a comment" append .github/workflows/pointers.yml "# ${var}X"
+          refuses "a secret in check.yml" edit .github/workflows/check.yml .jobs.lint.env.X "$(expression "${secret}X")"
+          refuses "a uses: on a tag" edit .github/workflows/pointers.yml '.jobs.pointers.steps[0].uses' actions/checkout@v7.0.1
+          refuses "a uses: on a branch" edit .github/workflows/pointers.yml '.jobs.pointers.steps[0].uses' actions/checkout@main
+          refuses "a uses: on 39 hex digits" edit .github/workflows/pointers.yml '.jobs.pointers.steps[0].uses' actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b
+          refuses "a uses: on uppercase hex" edit .github/workflows/pointers.yml '.jobs.pointers.steps[0].uses' actions/checkout@3D3C42E5AAC5BA805825DA76410C181273BA90B1
+          refuses "a uses: with a trailing word" edit .github/workflows/pointers.yml '.jobs.pointers.steps[0].uses' 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 x'
+          refuses "a local action" edit .github/workflows/check.yml '.jobs.lint.steps[0].uses' ./.github/actions/checkout
+          refuses "a docker action" edit .github/workflows/check.yml '.jobs.lint.steps[0].uses' docker://alpine:3
+          refuses "a reusable workflow on a branch" edit .github/workflows/check.yml .jobs.called.uses trymorse/morse-records/.github/workflows/pointers.yml@main
+          refuses "a uses: in flow style" append .github/workflows/check.yml '  flow: {runs-on: ubuntu-latest, steps: [{uses: actions/checkout@v4}]}'
+          refuses "a .yaml workflow on a tag" append .github/workflows/other.yaml 'jobs: {x: {runs-on: ubuntu-latest, steps: [{uses: actions/checkout@v4}]}}'
+          exit $failed
+
+  # Runs pointers.yml's read and archive steps against recorded attestations that name a real door boot
+  # record, the vault's dev boot at log2025-1.rekor.sigstore.dev index 194119183, read live from the
+  # shard. Then checks each archived leaf with the watcher's own verifier, check-door.py as
+  # trymorse/morse-enclave publishes it.
+  pointers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: trymorse/morse-enclave
+          ref: e6cdc422958266cedd937171bc7a3ba35618b225
+          path: enclave
+          persist-credentials: false
+      - run: |
+          set -euo pipefail
+          read_step=$RUNNER_TEMP/read.sh
+          archive_step=$RUNNER_TEMP/archive.py
+          yq -e '.jobs.pointers.steps[] | select(.id == "read") | .run' .github/workflows/pointers.yml >"$read_step"
+          yq -e '.jobs.pointers.steps[] | select(.id == "archive") | .run' .github/workflows/pointers.yml >"$archive_step"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet cbor2==6.1.5 cryptography==50.0.2 tuf==7.0.1 securesystemslib==1.6.0 urllib3==2.8.0
+          failed=0
+          fail() { echo "FAIL: $*"; failed=1; }
+
+          spki=bf9bd62f2e78406902fb66285ec89f20f2db6f3dfd7172c644268459d6139974
+          pointer='{"log": "log2025-1.rekor.sigstore.dev", "index": 194119183, "spki_sha256": "'$spki'", "boot": "77c6f4fa1476976d"}'
+          leaf=leaves/log2025-1.rekor.sigstore.dev/194119183.json
+          fixtures=$(mktemp -d)
+          # Today's shape, with string instances and no door, and the receipts shape: a door object on an
+          # instance object, listing one receipt twice and once more as 194119183.0.
+          cat >"$fixtures/dev.json" <<EOF
+          {"object": "proxy_attestation", "environment": "dev", "proxy_time": 1794424000, "instances": [
+            "hEShATgi",
+            {"door": {"spki_sha256": "$spki", "records": [{"log": "log2025-1.rekor.sigstore.dev", "index": 194119183}]}},
+            {"door": {"spki_sha256": "$spki", "records": [{"log": "log2025-1.rekor.sigstore.dev", "index": 194119183.0}]}}]}
+          EOF
+          sed 's/"environment": "dev"/"environment": "prod"/' "$fixtures/dev.json" >"$fixtures/prod.json"
+          printf '<html><head><title>302 Found</title></head></html>\n' >"$fixtures/login.html"
+          # Shell metacharacters and an expression in every field the read step sees.
+          mark=$(mktemp -u)
+          expression=$(printf '%s{{ %s }}' '$' 'github.token')
+          hostile=$(jq -n --arg spki "$spki" --arg mark "$mark" --arg expression "$expression" '
+            ["$(touch \($mark))", "`touch \($mark)`", "; touch \($mark)", "\n touch \($mark)", $expression] as $bad
+            | {object: "proxy_attestation", environment: "dev", instances: (
+                [$bad[] as $b | {door: {spki_sha256: $spki, records: [
+                  {log: $b, index: 1}, {log: "log2025-1.rekor.sigstore.dev\n\($b)", index: 2},
+                  {log: "log2025-1.rekor.sigstore.dev", index: $b}]}}]
+                + [$bad[] as $b | {door: {spki_sha256: $b, records: [{log: "log2025-1.rekor.sigstore.dev", index: 3}]}}]
+                + [{($bad[0]): $bad[1], door: {spki_sha256: $spki, records: [{log: "log2025-1.rekor.sigstore.dev", index: 194119183, x: $bad[4]}]}}])}')
+          printf '%s\n' "$hostile" >"$fixtures/hostile.json"
+
+          # Runs the two steps in a records checkout, with prod and dev answering from the given URLs.
+          run() {
+            local temp
+            temp=$(mktemp -d)
+            (cd "$records" && RUNNER_TEMP=$temp PROD_ATTESTATION=$1 DEV_ATTESTATION=$2 bash --noprofile --norc -eo pipefail "$read_step" \
+              && RUNNER_TEMP=$temp python3 -I "$archive_step")
+          }
+          fresh() {
+            records=$(mktemp -d)
+            git -C "$records" init --quiet
+          }
+          commit() { git -C "$records" add --all && git -C "$records" -c user.name=t -c user.email=t@t commit --quiet --allow-empty -m "$1"; }
+          verified() {
+            (cd enclave && "$RUNNER_TEMP/venv/bin/python" -I - "$records" "$1") <<'EOF'
+          import sys, tempfile, types
+          from pathlib import Path
+          records, environment = Path(sys.argv[1]), sys.argv[2]
+          cd = types.ModuleType("check_door")
+          cd.__file__ = str(Path("check-door.py").resolve())
+          exec(compile(Path(cd.__file__).read_text(), cd.__file__, "exec"), cd.__dict__)
+          pointers, notes = cd.read_pointers(records, environment)
+          assert pointers and not notes, (pointers, notes)
+          shards = cd.rekor.read_shards(cd.read_trusted_root(Path(tempfile.mkdtemp())))[0]
+          policy = cd.rekor.make_policy(cd.WITNESS_K, cd.WITNESSES)
+          for p in pointers:
+              logged = cd.rekor.verify_logged((records / "leaves" / p.log / f"{p.index}.json").read_bytes(), shards, policy)
+              record, document, _, _, _ = cd.read_record(logged.body.certificate)
+              found = (logged.origin, logged.index, record["spki_sha256"], cd.hpke_key_id(cd.verified(document), environment))
+              assert found == (p.log, p.index, p.spki_sha256, p.boot), (found, p)
+          EOF
+          }
+
+          fresh
+          run "file://$fixtures/missing.json" "file://$fixtures/dev.json" || fail "a run with prod unreachable failed"
+          [ "$(cat "$records/dev.jsonl" 2>/dev/null)" = "$pointer" ] || fail "dev.jsonl is not the one pointer: $(cat "$records/dev.jsonl" 2>/dev/null)"
+          [ -e "$records/$leaf" ] || fail "the run archived no leaf"
+          [ ! -e "$records/prod.jsonl" ] || fail "an unreachable prod wrote prod.jsonl"
+          verified dev || fail "check-door does not verify the archived leaf as the pointer names it"
+          commit first
+          run "file://$fixtures/login.html" "file://$fixtures/dev.json" || fail "a second run failed"
+          [ -z "$(git -C "$records" status --porcelain)" ] || fail "a second run over the same receipts changed $(git -C "$records" status --porcelain)"
+
+          fresh
+          run "file://$fixtures/prod.json" "file://$fixtures/login.html" || fail "a run with a dev record on the prod attestation failed"
+          [ -z "$(git -C "$records" status --porcelain)" ] || fail "a dev record on the prod attestation wrote $(git -C "$records" status --porcelain)"
+
+          fresh
+          run "file://$fixtures/missing.json" "file://$fixtures/hostile.json" || fail "a run over hostile fields failed"
+          [ ! -e "$mark" ] || fail "a field in the attestation ran a command"
+          [ "$(cat "$records/dev.jsonl" 2>/dev/null)" = "$pointer" ] || fail "hostile fields changed the pointers: $(cat "$records/dev.jsonl" 2>/dev/null)"
+
+          fresh
+          printf '%s\n' "$pointer" >"$records/dev.jsonl"
+          run "file://$fixtures/missing.json" "file://$fixtures/missing.json" || fail "a run with both environments unreachable failed"
+          [ -e "$records/$leaf" ] || fail "a pointer added by hand got no leaf"
+          [ "$(cat "$records/dev.jsonl")" = "$pointer" ] || fail "archiving a hand-added pointer changed dev.jsonl"
+          exit $failed
