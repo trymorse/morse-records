@@ -18,6 +18,8 @@ concurrency:
 
 jobs:
   pointers:
+    # A dispatch from another branch would push that branch's commits to main.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
