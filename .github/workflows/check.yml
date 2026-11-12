@@ -120,13 +120,19 @@ jobs:
           pointer='{"log": "log2025-1.rekor.sigstore.dev", "index": 194119183, "spki_sha256": "'$spki'", "boot": "77c6f4fa1476976d"}'
           leaf=leaves/log2025-1.rekor.sigstore.dev/194119183.json
           fixtures=$(mktemp -d)
-          # Today's shape, with string instances and no door, and the receipts shape: a door object on an
-          # instance object, listing one receipt twice and once more as 194119183.0.
+          # The relay's shape, string instances and a door object on each entry of receipts, and a door
+          # object on an instance object, listing one receipt three times, once as 194119183.0.
           cat >"$fixtures/dev.json" <<EOF
           {"object": "proxy_attestation", "environment": "dev", "proxy_time": 1794424000, "instances": [
             "hEShATgi",
             {"door": {"spki_sha256": "$spki", "records": [{"log": "log2025-1.rekor.sigstore.dev", "index": 194119183}]}},
-            {"door": {"spki_sha256": "$spki", "records": [{"log": "log2025-1.rekor.sigstore.dev", "index": 194119183.0}]}}]}
+            {"door": {"spki_sha256": "$spki", "records": [{"log": "log2025-1.rekor.sigstore.dev", "index": 194119183.0}]}}],
+           "receipts": [{"door": {"spki_sha256": "$spki", "records": [{"log": "log2025-1.rekor.sigstore.dev", "index": 194119183}]}}]}
+          EOF
+          # The relay's shape alone: every instance a string, and the receipt only in receipts.
+          cat >"$fixtures/receipts.json" <<EOF
+          {"object": "proxy_attestation", "environment": "dev", "proxy_time": 1794424000, "instances": ["hEShATgi", "hEShATgj"],
+           "receipts": [{"door": {"spki_sha256": "$spki", "records": [{"log": "log2025-1.rekor.sigstore.dev", "index": 194119183}]}}]}
           EOF
           sed 's/"environment": "dev"/"environment": "prod"/' "$fixtures/dev.json" >"$fixtures/prod.json"
           printf '<html><head><title>302 Found</title></head></html>\n' >"$fixtures/login.html"
@@ -140,7 +146,8 @@ jobs:
                   {log: $b, index: 1}, {log: "log2025-1.rekor.sigstore.dev\n\($b)", index: 2},
                   {log: "log2025-1.rekor.sigstore.dev", index: $b}]}}]
                 + [$bad[] as $b | {door: {spki_sha256: $b, records: [{log: "log2025-1.rekor.sigstore.dev", index: 3}]}}]
-                + [{($bad[0]): $bad[1], door: {spki_sha256: $spki, records: [{log: "log2025-1.rekor.sigstore.dev", index: 194119183, x: $bad[4]}]}}])}')
+                + [{($bad[0]): $bad[1], door: {spki_sha256: $spki, records: [{log: "log2025-1.rekor.sigstore.dev", index: 194119183, x: $bad[4]}]}}])}
+            | .receipts = .instances')
           printf '%s\n' "$hostile" >"$fixtures/hostile.json"
 
           # Runs the two steps in a records checkout, with prod and dev answering from the given URLs.
@@ -184,6 +191,11 @@ jobs:
           commit first
           run "file://$fixtures/login.html" "file://$fixtures/dev.json" || fail "a second run failed"
           [ -z "$(git -C "$records" status --porcelain)" ] || fail "a second run over the same receipts changed $(git -C "$records" status --porcelain)"
+
+          fresh
+          run "file://$fixtures/missing.json" "file://$fixtures/receipts.json" || fail "a run over the relay's receipts failed"
+          [ "$(cat "$records/dev.jsonl" 2>/dev/null)" = "$pointer" ] || fail "the relay's receipts gave dev.jsonl $(cat "$records/dev.jsonl" 2>/dev/null)"
+          verified dev || fail "check-door does not verify the leaf archived from the relay's receipts"
 
           fresh
           run "file://$fixtures/prod.json" "file://$fixtures/login.html" || fail "a run with a dev record on the prod attestation failed"

@@ -36,7 +36,9 @@ jobs:
       # answer with its attestation is skipped with a warning, so the other environment's pointers still
       # land: the vault's dev endpoint sits behind Cloudflare Access, which answers a runner with a
       # redirect to its login page. A candidate is a receipt from an instance's door object whose log is
-      # a Rekor v2 shard and whose index is an integer. Nothing read here reaches a command line.
+      # a Rekor v2 shard and whose index is an integer. The relay lists each instance's door object in
+      # receipts, beside instances, which stays a list of strings because every client reads it as one;
+      # a door object on an instance is read too. Nothing read here reaches a command line.
       - id: read
         run: |
           set -euo pipefail
@@ -59,7 +61,7 @@ jobs:
               continue
             fi
             if ! jq -c '
-              [.instances[] | objects | .door | objects
+              [(.instances, .receipts) | arrays | .[] | objects | .door | objects
                 | select(.spki_sha256 | type == "string" and test("\\A[0-9a-f]{64}\\z"))
                 | .spki_sha256 as $spki
                 | .records | arrays | .[] | objects
