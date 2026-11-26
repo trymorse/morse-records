@@ -118,3 +118,5 @@
 {"log": "log2025-1.rekor.sigstore.dev", "index": 214809377, "spki_sha256": "51ff1bfcc71c78a34940a99cf6641bc7aecd0a33cd81bfeeda1a6cab596d5190", "boot": "4257e31721ac6fb4"}
 {"log": "log2025-1.rekor.sigstore.dev", "index": 216130560, "spki_sha256": "51ff1bfcc71c78a34940a99cf6641bc7aecd0a33cd81bfeeda1a6cab596d5190", "boot": "bad2e15a252091f6"}
 {"log": "log2025-1.rekor.sigstore.dev", "index": 216133910, "spki_sha256": "51ff1bfcc71c78a34940a99cf6641bc7aecd0a33cd81bfeeda1a6cab596d5190", "boot": "7243a157712792a1"}
+{"log": "log2025-1.rekor.sigstore.dev", "index": 218485713, "spki_sha256": "51ff1bfcc71c78a34940a99cf6641bc7aecd0a33cd81bfeeda1a6cab596d5190", "boot": "8b4c8ce7323de41d"}
+{"log": "log2025-1.rekor.sigstore.dev", "index": 218488957, "spki_sha256": "51ff1bfcc71c78a34940a99cf6641bc7aecd0a33cd81bfeeda1a6cab596d5190", "boot": "1b4eaf74765f4994"}
